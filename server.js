@@ -96,7 +96,7 @@ app.get('/topics/:id/subtopics', async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT id, title FROM subtopics WHERE topic_id = $1 ORDER BY position',
+            'SELECT id, title, is_free FROM subtopics WHERE topic_id = $1 ORDER BY position',
             [targetID]
         );
         res.json(result.rows);
@@ -108,24 +108,39 @@ app.get('/topics/:id/subtopics', async (req, res) => {
 });
 
 //get content
-app.get('/subtopics/:id', authenticateToken, async (req, res) => {
-    const targetID = Number((req.params.id));
+const AUTH_MESSAGES = {
+    NO_TOKEN: 'Please log in to view this lesson.',
+    TOKEN_EXPIRED: 'Your session has expired. Please log in again.',
+    INVALID_TOKEN: 'Your login is not valid. Please log in again.'
+};
+
+app.get('/subtopics/:id', optionalAuth, async (req, res) => {
+    const targetID = Number(req.params.id);
 
     try {
         const result = await pool.query(
-            'SELECT title, video_link, note_content FROM subtopics WHERE id = $1',
+            'SELECT title, video_link, note_content, is_free FROM subtopics WHERE id = $1',
             [targetID]
         );
 
-        if(result.rowCount === 0){
-            return res.status(404).json({message: 'Item not found or does not exist'});
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
         }
 
-        res.json(result.rows[0]);
+        const lesson = result.rows[0];
+
+        if (!lesson.is_free && !req.user) {
+            return res.status(401).json({
+                error: AUTH_MESSAGES[req.authError],
+                code: req.authError
+            });
+        }
+
+        res.json(lesson);
     }
     catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Internal server error' });  
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -219,6 +234,27 @@ function authenticateToken(req, res, next) {
     next();
 }
 
+// Reads the login token if there is one, but never blocks the request.
+// Routes decide for themselves what a missing or bad token means.
+function optionalAuth(req, res, next) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        req.authError = 'NO_TOKEN';
+        return next();
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    try {
+        req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+    }
+    catch (err) {
+        req.authError = err?.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN';
+    }
+
+    next();
+}
 
 app.listen(port, () => {
     console.log("The server is running");

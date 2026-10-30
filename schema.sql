@@ -31,6 +31,7 @@ CREATE TABLE subtopics (
     video_link TEXT,
     note_content TEXT,
     position INTEGER NOT NULL,
+    is_free BOOLEAN NOT NULL DEFAULT FALSE,
     topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
     CONSTRAINT unique_subtopic_position_per_topic UNIQUE (topic_id, position),
     CONSTRAINT subtopic_has_content CHECK (
