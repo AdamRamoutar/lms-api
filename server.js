@@ -44,6 +44,31 @@ app.get('/levels', async (req, res) => {
     }
 });
 
+app.get('/levels/:id', async (req, res) => {
+    const targetID = Number(req.params.id);
+
+    if (!Number.isInteger(targetID) || targetID < 1) {
+        return res.status(400).json({ error: 'Invalid level id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            'SELECT id, name FROM levels WHERE id = $1',
+            [targetID]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Level not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 //get subjects
 app.get('/levels/:id/subjects', async (req, res) => {
     const targetID = Number((req.params.id));
