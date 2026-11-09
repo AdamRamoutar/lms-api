@@ -97,6 +97,58 @@ app.get('/levels/:id/subjects', async (req, res) => {
     }
 });
 
+// A subject's outline: its details, then each module with its topics. Titles are public, like the other browsing routes.
+app.get('/subjects/:id/outline', async (req, res) => {
+    const subjectId = Number(req.params.id);
+
+    if (!Number.isInteger(subjectId) || subjectId < 1) {
+        return res.status(400).json({ error: 'Invalid subject id.' });
+    }
+
+    try {
+        const subjectResult = await pool.query(
+            `SELECT s.id, s.name, s.description, s.unit, l.id AS level_id, l.name AS level_name
+             FROM subjects AS s
+             JOIN levels AS l ON l.id = s.level_id
+             WHERE s.id = $1`,
+            [subjectId]
+        );
+
+        if (subjectResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Subject not found.' });
+        }
+
+        // The two lists don't depend on each other, so they run together.
+        const [modulesResult, topicsResult] = await Promise.all([
+            pool.query(
+                'SELECT id, title, position FROM modules WHERE subject_id = $1 ORDER BY position',
+                [subjectId]
+            ),
+            pool.query(
+                `SELECT t.id, t.module_id, t.title, t.position, COUNT(st.id)::int AS lesson_count
+                 FROM topics AS t
+                 JOIN modules AS m ON m.id = t.module_id
+                 LEFT JOIN subtopics AS st ON st.topic_id = t.id
+                 WHERE m.subject_id = $1
+                 GROUP BY t.id
+                 ORDER BY t.position`,
+                [subjectId]
+            )
+        ]);
+
+        const modules = modulesResult.rows.map((moduleRow) => ({
+            ...moduleRow,
+            topics: topicsResult.rows.filter((topicRow) => topicRow.module_id === moduleRow.id)
+        }));
+
+        res.json({ ...subjectResult.rows[0], modules });
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 //get topics
 app.get('/subjects/:id/topics', async (req, res) => {
     const targetID = Number((req.params.id));

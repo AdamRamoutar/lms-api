@@ -14,7 +14,16 @@ CREATE TABLE subjects (
     name VARCHAR(255) NOT NULL,
     level_id INTEGER NOT NULL REFERENCES levels(id) ON DELETE CASCADE,
     unit INTEGER CHECK (unit IN (1, 2)),
+    description TEXT
     CONSTRAINT unique_subject_per_level UNIQUE (level_id, name)
+);
+
+CREATE TABLE modules (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    position INTEGER NOT NULL,
+    subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+    CONSTRAINT unique_module_position_per_subject UNIQUE (subject_id, position)
 );
 
 CREATE TABLE topics (
