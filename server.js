@@ -184,6 +184,48 @@ app.get('/topics/:id/subtopics', async (req, res) => {
     }
 });
 
+// A lesson's public details: its title, where it sits in the syllabus, and which sections it has.
+// It never includes the video link or the notes, so a visitor can see what a locked lesson is without being able to read it.
+app.get('/subtopics/:id/context', async (req, res) => {
+    const lessonId = Number(req.params.id);
+
+    if (!Number.isInteger(lessonId) || lessonId < 1) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT st.id,
+                    st.title,
+                    st.is_free,
+                    (st.video_link IS NOT NULL) AS has_video,
+                    (st.note_content IS NOT NULL) AS has_notes,
+                    t.id AS topic_id,
+                    t.title AS topic_title,
+                    s.id AS subject_id,
+                    s.name AS subject_name,
+                    l.name AS level_name
+             FROM subtopics AS st
+             JOIN topics AS t ON t.id = st.topic_id
+             JOIN modules AS m ON m.id = t.module_id
+             JOIN subjects AS s ON s.id = m.subject_id
+             JOIN levels AS l ON l.id = s.level_id
+             WHERE st.id = $1`,
+            [lessonId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 //get content
 const AUTH_MESSAGES = {
     NO_TOKEN: 'Please log in to view this lesson.',
@@ -220,6 +262,8 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+//auth
 
 app.post('/register', async (req, res) => {
     const { email, password } = req.body ?? {};
