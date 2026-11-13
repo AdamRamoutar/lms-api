@@ -149,24 +149,6 @@ app.get('/subjects/:id/outline', async (req, res) => {
     }
 });
 
-//get topics
-app.get('/subjects/:id/topics', async (req, res) => {
-    const targetID = Number((req.params.id));
-
-    try{
-        const result = await pool.query(
-            'SELECT * FROM topics WHERE subject_id = $1 ORDER BY position ASC',
-            [targetID]
-        );
-
-        res.json(result.rows);
-    }
-    catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
 //get subtopics
 app.get('/topics/:id/subtopics', async (req, res) => {
     const targetID = Number((req.params.id));
