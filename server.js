@@ -377,6 +377,35 @@ app.delete('/subtopics/:id/progress', authenticateToken, async (req, res) => {
     }
 });
 
+// The logged-in student's completed lessons in one subject, each with its topic, so a page can count them per topic.
+// A subject with no progress, or one that doesn't exist, returns an empty list: the answer is "nothing completed".
+app.get('/subjects/:id/progress', authenticateToken, async (req, res) => {
+    const subjectId = parsePositiveInt(req.params.id);
+
+    if (subjectId === null) {
+        return res.status(400).json({ error: 'Invalid subject id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT lp.subtopic_id, st.topic_id
+             FROM lesson_progress AS lp
+             JOIN subtopics AS st ON st.id = lp.subtopic_id
+             JOIN topics AS t ON t.id = st.topic_id
+             JOIN modules AS m ON m.id = t.module_id
+             WHERE lp.user_id = $1 AND m.subject_id = $2
+             ORDER BY lp.subtopic_id`,
+            [req.user.userId, subjectId]
+        );
+
+        res.json(result.rows);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // ---------- Accounts ----------
 
 app.post('/register', async (req, res) => {
