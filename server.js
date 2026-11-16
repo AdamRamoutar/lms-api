@@ -209,12 +209,6 @@ app.get('/subtopics/:id/context', async (req, res) => {
 });
 
 //get content
-const AUTH_MESSAGES = {
-    NO_TOKEN: 'Please log in to view this lesson.',
-    TOKEN_EXPIRED: 'Your session has expired. Please log in again.',
-    INVALID_TOKEN: 'Your login is not valid. Please log in again.'
-};
-
 app.get('/subtopics/:id', optionalAuth, async (req, res) => {
     const targetID = Number(req.params.id);
 
@@ -245,7 +239,77 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
     }
 });
 
+// Marks a lesson complete for the logged-in student. Safe to repeat: a second request changes nothing.
+// The student comes from the token and never from the request, so nobody can mark progress for someone else.
+app.put('/subtopics/:id/progress', authenticateToken, async (req, res) => {
+    const lessonId = Number(req.params.id);
+
+    if (!Number.isInteger(lessonId) || lessonId < 1) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        await pool.query(
+            `INSERT INTO lesson_progress (user_id, subtopic_id)
+             VALUES ($1, $2)
+             ON CONFLICT (user_id, subtopic_id) DO NOTHING`,
+            [req.user.userId, lessonId]
+        );
+
+        res.json({ message: 'Lesson marked as complete.' });
+    }
+    catch (err) {
+        // 23503 is a foreign key violation. Which key failed says whether the lesson or the account is missing.
+        if (err.code === '23503' && err.constraint === 'lesson_progress_subtopic_id_fkey') {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
+        // The token still verifies for up to an hour after an account is deleted, so to the page this is an invalid login.
+        if (err.code === '23503' && err.constraint === 'lesson_progress_user_id_fkey') {
+            return rejectToken(res, 'INVALID_TOKEN');
+        }
+
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Marks a lesson incomplete again. Safe to repeat: deleting a row that isn't there is not an error.
+app.delete('/subtopics/:id/progress', authenticateToken, async (req, res) => {
+    const lessonId = Number(req.params.id);
+
+    if (!Number.isInteger(lessonId) || lessonId < 1) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        await pool.query(
+            `DELETE FROM lesson_progress
+             WHERE user_id = $1 AND subtopic_id = $2`,
+            [req.user.userId, lessonId]
+        );
+
+        res.json({ message: 'Lesson marked as incomplete.' });
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 //auth
+// Why a token was refused. The code is what a page reacts to, and the message is a fallback it can show.
+// The wording is general, because the same codes are used by the lesson route and the progress routes.
+const AUTH_MESSAGES = {
+    NO_TOKEN: 'Please log in to continue.',
+    TOKEN_EXPIRED: 'Your session has expired. Please log in again.',
+    INVALID_TOKEN: 'Your login is not valid. Please log in again.'
+};
+
+// Every refusal has the same shape, whichever route produces it.
+function rejectToken(res, code) {
+    return res.status(401).json({ error: AUTH_MESSAGES[code], code });
+}
 
 app.post('/register', async (req, res) => {
     const { email, password } = req.body ?? {};
@@ -319,7 +383,7 @@ function authenticateToken(req, res, next) {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Access denied, no token provided' });
+        return rejectToken(res, 'NO_TOKEN');
     }
 
     const token = authHeader.split(' ')[1];
@@ -328,10 +392,7 @@ function authenticateToken(req, res, next) {
         req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     }
     catch (err) {
-        if (err.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token has expired.' });
-        }
-        return res.status(401).json({ error: 'Invalid token.' });
+        return rejectToken(res, err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN');
     }
 
     next();
