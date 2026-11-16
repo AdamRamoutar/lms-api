@@ -1,42 +1,114 @@
 require('dotenv').config();
-const { Pool } = require('pg');
+const express = require('express');
+const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const cors = require('cors');
+const { Pool } = require('pg');
 
-const express = require('express');
+// ---------- Settings ----------
+
+const PORT = process.env.PORT || 3000;
+const PASSWORD_MIN_LENGTH = 8;
+const BCRYPT_ROUNDS = 10;
+const TOKEN_LIFETIME = '1h';
+
+// ---------- Setup ----------
+
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://127.0.0.1:5500' }));
 
-const port = process.env.PORT || 3000;
-
+// On Render the whole connection comes from DATABASE_URL. Locally, the separate DB_ values are used.
+// The timeouts are only set for local use: a hosted database can take a moment to wake up,
+// and a short connection timeout would make the first request fail.
 const pool = new Pool(
-
     process.env.DATABASE_URL
-        ?
-        {
-            connectionString: process.env.DATABASE_URL,
-        }
-        :
-        {
+        ? { connectionString: process.env.DATABASE_URL }
+        : {
             user: process.env.DB_USER,
             host: process.env.DB_HOST,
             database: process.env.DB_NAME,
             password: process.env.DB_PASSWORD,
             port: process.env.DB_PORT,
-            max: 20, //overide default max connections
-            idleTimeoutMillis: 30000, //close idle clients after 30 seconds
-            connectionTimeoutMillis: 2000, //return an error after 2 seconds if connection fails
+            max: 20,
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis: 2000
         }
 );
 
-//get levels
+// ---------- Helpers ----------
+
+// Turns a value from the address into a whole number of at least 1, or null if it isn't one.
+function parsePositiveInt(value) {
+    const number = Number(value);
+
+    return Number.isInteger(number) && number >= 1 ? number : null;
+}
+
+// Why a token was refused. The code is what a page reacts to, and the message is a fallback it can show.
+// The wording is general, because the same codes are used by the lesson route and the progress routes.
+const AUTH_MESSAGES = {
+    NO_TOKEN: 'Please log in to continue.',
+    TOKEN_EXPIRED: 'Your session has expired. Please log in again.',
+    INVALID_TOKEN: 'Your login is not valid. Please log in again.'
+};
+
+// Every refusal has the same shape, whichever route produces it.
+function rejectToken(res, code) {
+    return res.status(401).json({ error: AUTH_MESSAGES[code], code });
+}
+
+// Reads the login token from a request. Returns the logged-in student, or the code that says why there isn't one.
+function readToken(req) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return { error: 'NO_TOKEN' };
+    }
+
+    try {
+        const user = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET, { algorithms: ['HS256'] });
+        return { user };
+    }
+    catch (err) {
+        return { error: err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN' };
+    }
+}
+
+// Blocks the request unless the student is logged in.
+function authenticateToken(req, res, next) {
+    const { user, error } = readToken(req);
+
+    if (error) {
+        return rejectToken(res, error);
+    }
+
+    req.user = user;
+    next();
+}
+
+// Reads the login token if there is one, but never blocks the request.
+// Routes decide for themselves what a missing or bad token means.
+function optionalAuth(req, res, next) {
+    const { user, error } = readToken(req);
+
+    if (user) {
+        req.user = user;
+    }
+    else {
+        req.authError = error;
+    }
+
+    next();
+}
+
+// ---------- Browsing: levels, subjects, topics, lessons ----------
+// Titles are public. Only a lesson's content is protected.
+
 app.get('/levels', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM levels ORDER BY id ASC');
+        const result = await pool.query('SELECT id, name FROM levels ORDER BY id');
         res.json(result.rows);
-
     }
     catch (err) {
         console.error(err);
@@ -45,17 +117,14 @@ app.get('/levels', async (req, res) => {
 });
 
 app.get('/levels/:id', async (req, res) => {
-    const targetID = Number(req.params.id);
+    const levelId = parsePositiveInt(req.params.id);
 
-    if (!Number.isInteger(targetID) || targetID < 1) {
+    if (levelId === null) {
         return res.status(400).json({ error: 'Invalid level id.' });
     }
 
     try {
-        const result = await pool.query(
-            'SELECT id, name FROM levels WHERE id = $1',
-            [targetID]
-        );
+        const result = await pool.query('SELECT id, name FROM levels WHERE id = $1', [levelId]);
 
         if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Level not found.' });
@@ -69,25 +138,28 @@ app.get('/levels/:id', async (req, res) => {
     }
 });
 
-//get subjects
+// The subjects of a level, optionally only one CAPE unit. A level with no subjects returns an empty list.
 app.get('/levels/:id/subjects', async (req, res) => {
-    const targetID = Number((req.params.id));
-    let result;
+    const levelId = parsePositiveInt(req.params.id);
+    const unit = req.query.unit === undefined ? null : Number(req.query.unit);
+
+    if (levelId === null) {
+        return res.status(400).json({ error: 'Invalid level id.' });
+    }
+
+    if (unit !== null && ![1, 2].includes(unit)) {
+        return res.status(400).json({ error: 'Invalid unit.' });
+    }
 
     try {
-        if (req.query.unit) {
-            const unitNumber = Number((req.query.unit));
-            result = await pool.query(
-                'SELECT * FROM subjects WHERE level_id = $1 AND unit = $2 ORDER BY id ASC',
-                [targetID, unitNumber]
-            );
-        }
-        else {
-            result = await pool.query(
-                'SELECT * FROM subjects WHERE level_id = $1 ORDER BY id ASC',
-                [targetID]
-            );
-        }
+        // A null unit means "any unit", so the same query serves both cases.
+        const result = await pool.query(
+            `SELECT id, name, level_id, unit, description
+             FROM subjects
+             WHERE level_id = $1 AND ($2::int IS NULL OR unit = $2)
+             ORDER BY id`,
+            [levelId, unit]
+        );
 
         res.json(result.rows);
     }
@@ -97,11 +169,11 @@ app.get('/levels/:id/subjects', async (req, res) => {
     }
 });
 
-// A subject's outline: its details, then each module with its topics. Titles are public, like the other browsing routes.
+// A subject's outline: its details, then each module with its topics.
 app.get('/subjects/:id/outline', async (req, res) => {
-    const subjectId = Number(req.params.id);
+    const subjectId = parsePositiveInt(req.params.id);
 
-    if (!Number.isInteger(subjectId) || subjectId < 1) {
+    if (subjectId === null) {
         return res.status(400).json({ error: 'Invalid subject id.' });
     }
 
@@ -149,15 +221,20 @@ app.get('/subjects/:id/outline', async (req, res) => {
     }
 });
 
-//get subtopics
+// The lessons in a topic. A topic with no lessons returns an empty list.
 app.get('/topics/:id/subtopics', async (req, res) => {
-    const targetID = Number((req.params.id));
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
 
     try {
         const result = await pool.query(
             'SELECT id, title, is_free FROM subtopics WHERE topic_id = $1 ORDER BY position',
-            [targetID]
+            [topicId]
         );
+
         res.json(result.rows);
     }
     catch (err) {
@@ -169,9 +246,9 @@ app.get('/topics/:id/subtopics', async (req, res) => {
 // A lesson's public details: its title, where it sits in the syllabus, and which sections it has.
 // It never includes the video link or the notes, so a visitor can see what a locked lesson is without being able to read it.
 app.get('/subtopics/:id/context', async (req, res) => {
-    const lessonId = Number(req.params.id);
+    const lessonId = parsePositiveInt(req.params.id);
 
-    if (!Number.isInteger(lessonId) || lessonId < 1) {
+    if (lessonId === null) {
         return res.status(400).json({ error: 'Invalid lesson id.' });
     }
 
@@ -208,14 +285,18 @@ app.get('/subtopics/:id/context', async (req, res) => {
     }
 });
 
-//get content
+// A lesson's content. Free lessons are open to everyone, and the rest need a logged-in student.
 app.get('/subtopics/:id', optionalAuth, async (req, res) => {
-    const targetID = Number(req.params.id);
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
 
     try {
         const result = await pool.query(
             'SELECT title, video_link, note_content, is_free FROM subtopics WHERE id = $1',
-            [targetID]
+            [lessonId]
         );
 
         if (result.rowCount === 0) {
@@ -225,10 +306,7 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
         const lesson = result.rows[0];
 
         if (!lesson.is_free && !req.user) {
-            return res.status(401).json({
-                error: AUTH_MESSAGES[req.authError],
-                code: req.authError
-            });
+            return rejectToken(res, req.authError);
         }
 
         res.json(lesson);
@@ -239,12 +317,14 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
     }
 });
 
+// ---------- Progress (logged-in students only) ----------
+
 // Marks a lesson complete for the logged-in student. Safe to repeat: a second request changes nothing.
 // The student comes from the token and never from the request, so nobody can mark progress for someone else.
 app.put('/subtopics/:id/progress', authenticateToken, async (req, res) => {
-    const lessonId = Number(req.params.id);
+    const lessonId = parsePositiveInt(req.params.id);
 
-    if (!Number.isInteger(lessonId) || lessonId < 1) {
+    if (lessonId === null) {
         return res.status(400).json({ error: 'Invalid lesson id.' });
     }
 
@@ -276,9 +356,9 @@ app.put('/subtopics/:id/progress', authenticateToken, async (req, res) => {
 
 // Marks a lesson incomplete again. Safe to repeat: deleting a row that isn't there is not an error.
 app.delete('/subtopics/:id/progress', authenticateToken, async (req, res) => {
-    const lessonId = Number(req.params.id);
+    const lessonId = parsePositiveInt(req.params.id);
 
-    if (!Number.isInteger(lessonId) || lessonId < 1) {
+    if (lessonId === null) {
         return res.status(400).json({ error: 'Invalid lesson id.' });
     }
 
@@ -297,19 +377,7 @@ app.delete('/subtopics/:id/progress', authenticateToken, async (req, res) => {
     }
 });
 
-//auth
-// Why a token was refused. The code is what a page reacts to, and the message is a fallback it can show.
-// The wording is general, because the same codes are used by the lesson route and the progress routes.
-const AUTH_MESSAGES = {
-    NO_TOKEN: 'Please log in to continue.',
-    TOKEN_EXPIRED: 'Your session has expired. Please log in again.',
-    INVALID_TOKEN: 'Your login is not valid. Please log in again.'
-};
-
-// Every refusal has the same shape, whichever route produces it.
-function rejectToken(res, code) {
-    return res.status(401).json({ error: AUTH_MESSAGES[code], code });
-}
+// ---------- Accounts ----------
 
 app.post('/register', async (req, res) => {
     const { email, password } = req.body ?? {};
@@ -318,12 +386,12 @@ app.post('/register', async (req, res) => {
         return res.status(400).json({ error: 'Email and password are required.' });
     }
 
-    if (password.length < 8) {
-        return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    if (password.length < PASSWORD_MIN_LENGTH) {
+        return res.status(400).json({ error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters.` });
     }
 
     try {
-        const hashedPassword = await bcrypt.hash(password, 10);
+        const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
         await pool.query(
             'INSERT INTO users (email, password) VALUES ($1, $2)',
@@ -333,9 +401,11 @@ app.post('/register', async (req, res) => {
         res.status(201).json({ message: 'User created successfully.' });
     }
     catch (err) {
+        // 23505 is a unique violation: the email is already registered.
         if (err.code === '23505') {
             return res.status(409).json({ error: 'Email already exists.' });
         }
+
         console.error(err);
         res.status(500).json({ error: 'Internal server error' });
     }
@@ -355,20 +425,15 @@ app.post('/login', async (req, res) => {
         );
         const user = result.rows[0];
 
-        if (!user) {
-            return res.status(401).json({ error: 'Invalid email or password' });
-        }
-
-        const isMatch = await bcrypt.compare(password, user.password);
-
-        if (!isMatch) {
+        // The same answer for an unknown email and a wrong password, so a visitor can't tell which accounts exist.
+        if (!user || !(await bcrypt.compare(password, user.password))) {
             return res.status(401).json({ error: 'Invalid email or password' });
         }
 
         const token = jwt.sign(
             { userId: user.id, email: user.email },
             process.env.JWT_SECRET,
-            { expiresIn: '1h' }
+            { expiresIn: TOKEN_LIFETIME }
         );
 
         res.status(200).json({ message: 'Login successful', token });
@@ -379,48 +444,20 @@ app.post('/login', async (req, res) => {
     }
 });
 
-function authenticateToken(req, res, next) {
-    const authHeader = req.headers.authorization;
+// ---------- Errors outside any route ----------
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return rejectToken(res, 'NO_TOKEN');
+// A request body that isn't valid JSON is the sender's mistake, so it gets a plain 400 and no stack trace.
+// This must come after every route.
+app.use((err, req, res, next) => {
+    if (err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Invalid JSON.' });
     }
 
-    const token = authHeader.split(' ')[1];
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+});
 
-    try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    }
-    catch (err) {
-        return rejectToken(res, err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN');
-    }
-
-    next();
-}
-
-// Reads the login token if there is one, but never blocks the request.
-// Routes decide for themselves what a missing or bad token means.
-function optionalAuth(req, res, next) {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        req.authError = 'NO_TOKEN';
-        return next();
-    }
-
-    const token = authHeader.split(' ')[1];
-
-    try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    }
-    catch (err) {
-        req.authError = err?.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN';
-    }
-
-    next();
-}
-
-app.listen(port, () => {
-    console.log("The server is running");
+app.listen(PORT, () => {
+    console.log(`The server is running on port ${PORT}`);
 });
 
