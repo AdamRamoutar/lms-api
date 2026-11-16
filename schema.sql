@@ -53,3 +53,11 @@ CREATE TABLE subtopics (
         video_link IS NOT NULL OR note_content IS NOT NULL
     )
 );
+
+-- One row means a student has marked a lesson complete. Removing the row marks it incomplete again.
+CREATE TABLE lesson_progress (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subtopic_id INTEGER NOT NULL REFERENCES subtopics(id) ON DELETE CASCADE,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, subtopic_id)
+);
