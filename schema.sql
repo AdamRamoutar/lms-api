@@ -4,7 +4,10 @@
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL
+    password VARCHAR(255) NOT NULL,
+    -- Who may do what. New accounts are always students, and admins are made by hand in the database.
+    role VARCHAR(20) NOT NULL DEFAULT 'student',
+    CONSTRAINT users_role_valid CHECK (role IN ('student', 'admin'))
 );
 
 CREATE TABLE levels (
