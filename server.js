@@ -102,6 +102,38 @@ function optionalAuth(req, res, next) {
     next();
 }
 
+// Looks up a student's current account in the database. The token only says who they are, and it stays valid
+// for an hour, so a role kept in it could be out of date. Returns null if the account no longer exists.
+async function loadCurrentUser(userId) {
+    const result = await pool.query('SELECT id, email, role FROM users WHERE id = $1', [userId]);
+
+    return result.rows[0] ?? null;
+}
+
+// Lets only admins through. It must come after authenticateToken, because it needs req.user.
+async function requireAdmin(req, res, next) {
+    try {
+        const user = await loadCurrentUser(req.user.userId);
+
+        // The token still verifies for up to an hour after an account is deleted, so to the page this is an invalid login.
+        if (!user) {
+            return rejectToken(res, 'INVALID_TOKEN');
+        }
+
+        // 403 means "I know who you are, and you may not do this". 401 would mean "I don't know who you are".
+        if (user.role !== 'admin') {
+            return res.status(403).json({ error: 'You do not have access to this.', code: 'FORBIDDEN' });
+        }
+
+        req.currentUser = user;
+        next();
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+}
+
 // ---------- Browsing: levels, subjects, topics, lessons ----------
 // Titles are public. Only a lesson's content is protected.
 
@@ -471,6 +503,29 @@ app.post('/login', async (req, res) => {
         console.error(err);
         res.status(500).json({ error: 'Internal server error' });
     }
+});
+
+// Who the logged-in student is. The page uses it to decide whether to show the Admin link,
+// but the real protection is requireAdmin, which runs on the server for every admin route.
+app.get('/me', authenticateToken, async (req, res) => {
+    try {
+        const user = await loadCurrentUser(req.user.userId);
+
+        if (!user) {
+            return rejectToken(res, 'INVALID_TOKEN');
+        }
+
+        res.json({ email: user.email, role: user.role });
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Temporary: proves requireAdmin works. Removed once the real admin routes exist.
+app.get('/admin/ping', authenticateToken, requireAdmin, (req, res) => {
+    res.json({ ok: true });
 });
 
 // ---------- Errors outside any route ----------
