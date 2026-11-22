@@ -232,7 +232,7 @@ app.get('/subjects/:id/outline', async (req, res) => {
                 `SELECT t.id, t.module_id, t.title, t.position, COUNT(st.id)::int AS lesson_count
                  FROM topics AS t
                  JOIN modules AS m ON m.id = t.module_id
-                 LEFT JOIN subtopics AS st ON st.topic_id = t.id
+                 LEFT JOIN subtopics AS st ON st.topic_id = t.id AND st.is_published
                  WHERE m.subject_id = $1
                  GROUP BY t.id
                  ORDER BY t.position`,
@@ -263,7 +263,7 @@ app.get('/topics/:id/subtopics', async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT id, title, is_free FROM subtopics WHERE topic_id = $1 ORDER BY position',
+            'SELECT id, title, is_free FROM subtopics WHERE topic_id = $1 AND is_published ORDER BY position',
             [topicId]
         );
 
@@ -301,7 +301,7 @@ app.get('/subtopics/:id/context', async (req, res) => {
              JOIN modules AS m ON m.id = t.module_id
              JOIN subjects AS s ON s.id = m.subject_id
              JOIN levels AS l ON l.id = s.level_id
-             WHERE st.id = $1`,
+             WHERE st.id = $1 AND st.is_published`,
             [lessonId]
         );
 
@@ -327,7 +327,7 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT title, video_link, note_content, is_free FROM subtopics WHERE id = $1',
+            'SELECT title, video_link, note_content, is_free FROM subtopics WHERE id = $1 AND is_published',
             [lessonId]
         );
 
@@ -361,6 +361,13 @@ app.put('/subtopics/:id/progress', authenticateToken, async (req, res) => {
     }
 
     try {
+        // A draft isn't visible to students, so it can't be completed either.
+        const lesson = await pool.query('SELECT 1 FROM subtopics WHERE id = $1 AND is_published', [lessonId]);
+
+        if (lesson.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
         await pool.query(
             `INSERT INTO lesson_progress (user_id, subtopic_id)
              VALUES ($1, $2)
@@ -425,7 +432,7 @@ app.get('/subjects/:id/progress', authenticateToken, async (req, res) => {
              JOIN subtopics AS st ON st.id = lp.subtopic_id
              JOIN topics AS t ON t.id = st.topic_id
              JOIN modules AS m ON m.id = t.module_id
-             WHERE lp.user_id = $1 AND m.subject_id = $2
+             WHERE lp.user_id = $1 AND m.subject_id = $2 AND st.is_published
              ORDER BY lp.subtopic_id`,
             [req.user.userId, subjectId]
         );
