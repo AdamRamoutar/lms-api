@@ -42,22 +42,19 @@ CREATE TABLE topics (
     CONSTRAINT unique_topic_position_per_module UNIQUE (module_id, position)
 );
 
--- A lesson. It needs a video, notes, or both. Free lessons can be opened without a subscription.
+-- A lesson. It can have notes, any number of videos (see lesson_videos), or both. Free lessons can be opened without a subscription.
 -- A draft is only for admins, and a lesson is published when it is ready for students.
+-- A published lesson must have notes or at least one video. Because that depends on another table, the API enforces it.
 CREATE TABLE subtopics (
     id SERIAL PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
-    video_link TEXT,
     note_content TEXT,
     position INTEGER NOT NULL,
     is_free BOOLEAN NOT NULL DEFAULT FALSE,
     is_published BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-    CONSTRAINT unique_subtopic_position_per_topic UNIQUE (topic_id, position),
-    CONSTRAINT subtopic_has_content CHECK (
-        video_link IS NOT NULL OR note_content IS NOT NULL
-    )
+    CONSTRAINT unique_subtopic_position_per_topic UNIQUE (topic_id, position)
 );
 
 -- One row per video in a lesson. The title is optional, and position is the order within the lesson.
