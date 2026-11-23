@@ -289,7 +289,8 @@ app.get('/subtopics/:id/context', async (req, res) => {
             `SELECT st.id,
                     st.title,
                     st.is_free,
-                    (st.video_link IS NOT NULL) AS has_video,
+                    EXISTS (SELECT 1 FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS has_video,
+                    (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS video_count,
                     (st.note_content IS NOT NULL) AS has_notes,
                     t.id AS topic_id,
                     t.title AS topic_title,
@@ -341,7 +342,14 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
             return rejectToken(res, req.authError);
         }
 
-        res.json(lesson);
+        // Only after the access check, so a locked lesson's videos are never even read for a visitor.
+        const videosResult = await pool.query(
+            'SELECT id, title, video_link, position FROM lesson_videos WHERE subtopic_id = $1 ORDER BY position',
+            [lessonId]
+        );
+
+        // video_link stays in the answer until the study page uses the list, so the live site keeps working in between.
+        res.json({ ...lesson, videos: videosResult.rows });
     }
     catch (err) {
         console.error(err);
