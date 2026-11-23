@@ -60,6 +60,17 @@ CREATE TABLE subtopics (
     )
 );
 
+-- One row per video in a lesson. The title is optional, and position is the order within the lesson.
+CREATE TABLE lesson_videos (
+    id SERIAL PRIMARY KEY,
+    subtopic_id INTEGER NOT NULL REFERENCES subtopics(id) ON DELETE CASCADE,
+    title VARCHAR(255),
+    video_link TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    CONSTRAINT lesson_video_link_is_web_address CHECK (video_link ~* '^https?://'),
+    CONSTRAINT unique_video_position_per_lesson UNIQUE (subtopic_id, position)
+);
+
 -- One row means a student has marked a lesson complete. Removing the row marks it incomplete again.
 CREATE TABLE lesson_progress (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -67,3 +78,4 @@ CREATE TABLE lesson_progress (
     completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, subtopic_id)
 );
+
