@@ -328,7 +328,7 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT title, video_link, note_content, is_free FROM subtopics WHERE id = $1 AND is_published',
+            'SELECT title, note_content, is_free FROM subtopics WHERE id = $1 AND is_published',
             [lessonId]
         );
 
@@ -348,7 +348,6 @@ app.get('/subtopics/:id', optionalAuth, async (req, res) => {
             [lessonId]
         );
 
-        // video_link stays in the answer until the study page uses the list, so the live site keeps working in between.
         res.json({ ...lesson, videos: videosResult.rows });
     }
     catch (err) {
