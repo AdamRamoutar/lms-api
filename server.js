@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 3000;
 const PASSWORD_MIN_LENGTH = 8;
 const BCRYPT_ROUNDS = 10;
 const TOKEN_LIFETIME = '1h';
+const TITLE_MAX_LENGTH = 255;
 
 // ---------- Setup ----------
 
@@ -132,6 +133,38 @@ async function requireAdmin(req, res, next) {
         console.error(err);
         res.status(500).json({ error: 'Internal server error' });
     }
+}
+
+// The body of an admin request, or an empty object if it isn't a plain object.
+function readBody(req) {
+    const body = req.body;
+
+    return body !== null && typeof body === 'object' && !Array.isArray(body) ? body : {};
+}
+
+// A title from an admin form: real text, no longer than the column allows. Returns the cleaned title, or null if it isn't valid.
+function cleanTitle(value) {
+    if (typeof value !== 'string') {
+        return null;
+    }
+
+    const title = value.trim();
+
+    return title !== '' && title.length <= TITLE_MAX_LENGTH ? title : null;
+}
+
+// Notes may be empty. Blank notes are stored as null, so "has notes" never has to wonder about empty text.
+// Returns { ok: true, value } or { ok: false } when the value isn't text or null.
+function cleanNotes(value) {
+    if (value === null) {
+        return { ok: true, value: null };
+    }
+
+    if (typeof value !== 'string') {
+        return { ok: false };
+    }
+
+    return { ok: true, value: value.trim() === '' ? null : value };
 }
 
 // ---------- Browsing: levels, subjects, topics, lessons ----------
@@ -530,6 +563,137 @@ app.get('/admin/lessons/:id', async (req, res) => {
     }
 });
 
+// Creates a new lesson at the end of a topic. It starts as an empty draft, so students can't see it.
+app.post('/admin/topics/:id/lessons', async (req, res) => {
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
+
+    const title = cleanTitle(readBody(req).title);
+
+    if (title === null) {
+        return res.status(400).json({ error: `A title is required, up to ${TITLE_MAX_LENGTH} characters.` });
+    }
+
+    try {
+        // The position is worked out in the same statement as the insert: one more than the highest in this topic.
+        const result = await pool.query(
+            `INSERT INTO subtopics (title, position, topic_id)
+             VALUES ($1, (SELECT COALESCE(MAX(position), 0) + 1 FROM subtopics WHERE topic_id = $2), $2)
+             RETURNING id, title, position, is_free, is_published, updated_at`,
+            [title, topicId]
+        );
+
+        res.status(201).json(result.rows[0]);
+    }
+    catch (err) {
+        // 23503 is a foreign key violation: the topic doesn't exist.
+        if (err.code === '23503') {
+            return res.status(404).json({ error: 'Topic not found.' });
+        }
+
+        // 23505 is a unique violation: another lesson took the same position at the same moment.
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'Another lesson was added at the same moment. Please try again.' });
+        }
+
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Changes a lesson's title, notes or free setting. Only the fields sent are changed.
+// It never changes is_published or the order: publishing has its own rules, and ordering has its own route.
+app.patch('/admin/lessons/:id', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    const body = readBody(req);
+    const hasTitle = 'title' in body;
+    const hasNotes = 'note_content' in body;
+    const hasFree = 'is_free' in body;
+
+    if (!hasTitle && !hasNotes && !hasFree) {
+        return res.status(400).json({ error: 'Send at least one of: title, note_content, is_free.' });
+    }
+
+    try {
+        const currentResult = await pool.query(
+            `SELECT title, note_content, is_free, is_published,
+                    (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = subtopics.id) AS video_count
+             FROM subtopics
+             WHERE id = $1`,
+            [lessonId]
+        );
+
+        if (currentResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
+        const current = currentResult.rows[0];
+        let title = current.title;
+        let notes = current.note_content;
+        let isFree = current.is_free;
+
+        if (hasTitle) {
+            const cleaned = cleanTitle(body.title);
+
+            if (cleaned === null) {
+                return res.status(400).json({ error: `A title is required, up to ${TITLE_MAX_LENGTH} characters.` });
+            }
+
+            title = cleaned;
+        }
+
+        if (hasNotes) {
+            const cleaned = cleanNotes(body.note_content);
+
+            if (!cleaned.ok) {
+                return res.status(400).json({ error: 'Notes must be text, or null to clear them.' });
+            }
+
+            notes = cleaned.value;
+        }
+
+        if (hasFree) {
+            if (typeof body.is_free !== 'boolean') {
+                return res.status(400).json({ error: 'is_free must be true or false.' });
+            }
+
+            isFree = body.is_free;
+        }
+
+        // A live lesson must keep notes or at least one video, at every save.
+        const hasNotesNow = notes !== null && notes.trim() !== '';
+
+        if (current.is_published && !hasNotesNow && current.video_count === 0) {
+            return res.status(409).json({
+                error: 'A live lesson needs notes or at least one video. Add one, or unpublish the lesson first.',
+                code: 'LESSON_WOULD_BE_EMPTY'
+            });
+        }
+
+        const result = await pool.query(
+            `UPDATE subtopics
+             SET title = $1, note_content = $2, is_free = $3, updated_at = NOW()
+             WHERE id = $4
+             RETURNING id, title, note_content, position, is_free, is_published, updated_at`,
+            [title, notes, isFree, lessonId]
+        );
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // ---------- Accounts ----------
 
 app.post('/register', async (req, res) => {
@@ -622,6 +786,10 @@ app.get('/me', authenticateToken, async (req, res) => {
 app.use((err, req, res, next) => {
     if (err.type === 'entity.parse.failed') {
         return res.status(400).json({ error: 'Invalid JSON.' });
+    }
+
+    if (err.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'That is too large to save.' });
     }
 
     console.error(err);
