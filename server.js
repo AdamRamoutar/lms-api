@@ -452,6 +452,84 @@ app.get('/subjects/:id/progress', authenticateToken, async (req, res) => {
     }
 });
 
+// ---------- Admin (admins only) ----------
+
+// One gate for everything under /admin, so a route added later can't forget it.
+// It must stay above every admin route, because Express runs things from the top down.
+app.use('/admin', authenticateToken, requireAdmin);
+
+// The lessons in a topic, drafts included, with what an admin needs to see at a glance.
+app.get('/admin/topics/:id/lessons', async (req, res) => {
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
+
+    try {
+        const topicResult = await pool.query('SELECT 1 FROM topics WHERE id = $1', [topicId]);
+
+        if (topicResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Topic not found.' });
+        }
+
+        // "Has notes" means real text, so a blank note counts as no note.
+        const result = await pool.query(
+            `SELECT st.id, st.title, st.position, st.is_free, st.is_published, st.updated_at,
+                    (COALESCE(btrim(st.note_content), '') <> '') AS has_notes,
+                    (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS video_count
+             FROM subtopics AS st
+             WHERE st.topic_id = $1
+             ORDER BY st.position`,
+            [topicId]
+        );
+
+        res.json(result.rows);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// One lesson in full, for the editor: its content, its place in the syllabus, and its videos. Drafts are included.
+app.get('/admin/lessons/:id', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        const lessonResult = await pool.query(
+            `SELECT st.id, st.title, st.note_content, st.position, st.is_free, st.is_published, st.updated_at,
+                    t.id AS topic_id, t.title AS topic_title,
+                    s.id AS subject_id, s.name AS subject_name
+             FROM subtopics AS st
+             JOIN topics AS t ON t.id = st.topic_id
+             JOIN modules AS m ON m.id = t.module_id
+             JOIN subjects AS s ON s.id = m.subject_id
+             WHERE st.id = $1`,
+            [lessonId]
+        );
+
+        if (lessonResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
+        const videosResult = await pool.query(
+            'SELECT id, title, video_link, position FROM lesson_videos WHERE subtopic_id = $1 ORDER BY position',
+            [lessonId]
+        );
+
+        res.json({ ...lessonResult.rows[0], videos: videosResult.rows });
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // ---------- Accounts ----------
 
 app.post('/register', async (req, res) => {
@@ -535,11 +613,6 @@ app.get('/me', authenticateToken, async (req, res) => {
         console.error(err);
         res.status(500).json({ error: 'Internal server error' });
     }
-});
-
-// Temporary: proves requireAdmin works. Removed once the real admin routes exist.
-app.get('/admin/ping', authenticateToken, requireAdmin, (req, res) => {
-    res.json({ ok: true });
 });
 
 // ---------- Errors outside any route ----------
