@@ -167,6 +167,25 @@ function cleanNotes(value) {
     return { ok: true, value: value.trim() === '' ? null : value };
 }
 
+// What stops a lesson from being published. An empty list means it's ready.
+// This is the one definition of the rules: the publish route enforces it, the edit route protects live lessons with it,
+// and the editor's checklist shows it.
+function findPublishProblems({ title, note_content, video_count }) {
+    const problems = [];
+
+    if (typeof title !== 'string' || title.trim() === '') {
+        problems.push({ code: 'MISSING_TITLE', message: 'Add a title.' });
+    }
+
+    const hasNotes = typeof note_content === 'string' && note_content.trim() !== '';
+
+    if (!hasNotes && video_count === 0) {
+        problems.push({ code: 'MISSING_CONTENT', message: 'Add notes or at least one video.' });
+    }
+
+    return problems;
+}
+
 // ---------- Browsing: levels, subjects, topics, lessons ----------
 // Titles are public. Only a lesson's content is protected.
 
@@ -555,7 +574,14 @@ app.get('/admin/lessons/:id', async (req, res) => {
             [lessonId]
         );
 
-        res.json({ ...lessonResult.rows[0], videos: videosResult.rows });
+        const lesson = lessonResult.rows[0];
+        const videos = videosResult.rows;
+
+        res.json({
+            ...lesson,
+            videos,
+            publish_problems: findPublishProblems({ ...lesson, video_count: videos.length })
+        });
     }
     catch (err) {
         console.error(err);
@@ -668,10 +694,8 @@ app.patch('/admin/lessons/:id', async (req, res) => {
             isFree = body.is_free;
         }
 
-        // A live lesson must keep notes or at least one video, at every save.
-        const hasNotesNow = notes !== null && notes.trim() !== '';
-
-        if (current.is_published && !hasNotesNow && current.video_count === 0) {
+        // A live lesson must keep meeting the publishing rules, at every save.
+        if (current.is_published && findPublishProblems({ title, note_content: notes, video_count: current.video_count }).length > 0) {
             return res.status(409).json({
                 error: 'A live lesson needs notes or at least one video. Add one, or unpublish the lesson first.',
                 code: 'LESSON_WOULD_BE_EMPTY'
@@ -685,6 +709,90 @@ app.patch('/admin/lessons/:id', async (req, res) => {
              RETURNING id, title, note_content, position, is_free, is_published, updated_at`,
             [title, notes, isFree, lessonId]
         );
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Makes a lesson visible to students, but only if it meets the publishing rules.
+// The check and the change happen in one statement, so nothing can slip in between them.
+app.post('/admin/lessons/:id/publish', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        // Publishing a lesson that is already published changes nothing, including its "last edited" time.
+        const result = await pool.query(
+            `UPDATE subtopics
+             SET is_published = TRUE,
+                 updated_at = CASE WHEN is_published THEN updated_at ELSE NOW() END
+             WHERE id = $1
+               AND btrim(title) <> ''
+               AND (COALESCE(btrim(note_content), '') <> ''
+                    OR EXISTS (SELECT 1 FROM lesson_videos AS lv WHERE lv.subtopic_id = subtopics.id))
+             RETURNING id, title, position, is_free, is_published, updated_at`,
+            [lessonId]
+        );
+
+        if (result.rowCount === 1) {
+            return res.json(result.rows[0]);
+        }
+
+        // Nothing changed: either there is no such lesson, or it isn't ready. Find out which, and say why.
+        const lessonResult = await pool.query(
+            `SELECT title, note_content,
+                    (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = subtopics.id) AS video_count
+             FROM subtopics
+             WHERE id = $1`,
+            [lessonId]
+        );
+
+        if (lessonResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
+        const problems = findPublishProblems(lessonResult.rows[0]);
+
+        res.status(409).json({
+            error: problems.length > 0 ? 'This lesson is not ready to publish.' : 'The lesson changed while publishing. Please try again.',
+            code: 'LESSON_NOT_READY',
+            problems
+        });
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Hides a lesson from students again. Nothing is deleted, and students keep their progress on it.
+app.post('/admin/lessons/:id/unpublish', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `UPDATE subtopics
+             SET is_published = FALSE,
+                 updated_at = CASE WHEN is_published THEN NOW() ELSE updated_at END
+             WHERE id = $1
+             RETURNING id, title, position, is_free, is_published, updated_at`,
+            [lessonId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
 
         res.json(result.rows[0]);
     }
