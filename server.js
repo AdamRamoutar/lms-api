@@ -4,6 +4,7 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const { parse } = require('dotenv');
 
 // ---------- Settings ----------
 
@@ -1124,6 +1125,74 @@ app.delete('/admin/videos/:id', async (req, res) => {
         });
 
         res.json(videos);
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// What deleting a lesson would remove, so the page can say so before it asks.
+app.get('/admin/lessons/:id/impact', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT st.title, st.is_published,
+                    (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS video_count,
+                    (SELECT COUNT(*)::int FROM lesson_progress AS lp WHERE lp.subtopic_id = st.id) AS students_completed
+             FROM subtopics AS st
+             WHERE st.id = $1`,
+            [lessonId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Lesson not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Deletes a lesson, its videos, and every student's completed mark for it. A live lesson must be unpublished first.
+app.delete('/admin/lessons/:id', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    try {
+        const deleted = await withTransaction(async (client) => {
+            const lesson = await lockLesson(client, lessonId);
+
+            if (lesson.is_published) {
+                throw new Refusal(409, {
+                    error: 'This lesson is live. Unpublish it first, then delete it.',
+                    code: 'LESSON_IS_LIVE'
+                });
+            }
+
+            // Counted before the delete, so the answer can say what was removed.
+            const counts = await client.query(
+                `SELECT (SELECT COUNT(*)::int FROM lesson_videos WHERE subtopic_id = $1) AS videos,
+                        (SELECT COUNT(*)::int FROM lesson_progress WHERE subtopic_id = $1) AS students_completed`,
+                [lessonId]
+            );
+
+            await client.query('DELETE FROM subtopics WHERE id = $1', [lessonId]);
+
+            return { title: lesson.title, ...counts.rows[0] };
+        });
+
+        res.json({ message: 'Lesson deleted.', deleted });
     }
     catch (err) {
         handleAdminError(res, err);
