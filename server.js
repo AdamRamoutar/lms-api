@@ -12,6 +12,7 @@ const PASSWORD_MIN_LENGTH = 8;
 const BCRYPT_ROUNDS = 10;
 const TOKEN_LIFETIME = '1h';
 const TITLE_MAX_LENGTH = 255;
+const VIDEO_LINK_MAX_LENGTH = 2048;
 
 // ---------- Setup ----------
 
@@ -184,6 +185,115 @@ function findPublishProblems({ title, note_content, video_count }) {
     }
 
     return problems;
+}
+
+// A refusal that carries its own answer, so work inside a transaction can stop and roll back cleanly.
+class Refusal extends Error {
+    constructor(status, body) {
+        super(body.error);
+        this.status = status;
+        this.body = body;
+    }
+}
+
+// Sends the right answer for a failed admin request: a planned refusal keeps its own answer, anything else is a 500.
+function handleAdminError(res, err) {
+    if (err instanceof Refusal) {
+        return res.status(err.status).json(err.body);
+    }
+
+    // 23514 is a check violation: the database refused a link that isn't a web address.
+    if (err.code === '23514') {
+        return res.status(400).json({ error: 'A video link must be a web address starting with http:// or https://.' });
+    }
+
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+}
+
+// Runs several changes as one unit: they all happen, or none do. The work gets its own connection to use.
+async function withTransaction(work) {
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+        const result = await work(client);
+        await client.query('COMMIT');
+        return result;
+    }
+    catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+    }
+    finally {
+        client.release();
+    }
+}
+
+// Locks a lesson's row until the transaction ends, so two requests changing its videos take turns.
+// Returns what the rules need to know about the lesson, or stops the request if there is no such lesson.
+async function lockLesson(client, lessonId) {
+    const result = await client.query(
+        'SELECT title, note_content, is_published FROM subtopics WHERE id = $1 FOR UPDATE',
+        [lessonId]
+    );
+
+    if (result.rowCount === 0) {
+        throw new Refusal(404, { error: 'Lesson not found.' });
+    }
+
+    return result.rows[0];
+}
+
+// A video link from an admin form: a web address, not too long. Returns the cleaned link, or null if it isn't valid.
+function cleanVideoLink(value) {
+    if (typeof value !== 'string') {
+        return null;
+    }
+
+    const link = value.trim();
+
+    if (link === '' || link.length > VIDEO_LINK_MAX_LENGTH || !/^https?:\/\//i.test(link)) {
+        return null;
+    }
+
+    try {
+        const { protocol } = new URL(link);
+        return protocol === 'https:' || protocol === 'http:' ? link : null;
+    }
+    catch {
+        return null;
+    }
+}
+
+// A video's title is optional. A blank title is stored as null, and the page then shows "Video 1", "Video 2".
+// Returns { ok: true, value } or { ok: false } when the value isn't text or null, or is too long.
+function cleanVideoTitle(value) {
+    if (value === null) {
+        return { ok: true, value: null };
+    }
+
+    if (typeof value !== 'string') {
+        return { ok: false };
+    }
+
+    const title = value.trim();
+
+    if (title.length > TITLE_MAX_LENGTH) {
+        return { ok: false };
+    }
+
+    return { ok: true, value: title === '' ? null : title };
+}
+
+// A lesson's videos in order, for the answers that send the whole list back.
+async function loadVideos(client, lessonId) {
+    const result = await client.query(
+        'SELECT id, title, video_link, position FROM lesson_videos WHERE subtopic_id = $1 ORDER BY position',
+        [lessonId]
+    );
+
+    return result.rows;
 }
 
 // ---------- Browsing: levels, subjects, topics, lessons ----------
@@ -799,6 +909,224 @@ app.post('/admin/lessons/:id/unpublish', async (req, res) => {
     catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Internal server error' });
+    }
+
+});
+
+// Adds a video at the end of a lesson's list.
+app.post('/admin/lessons/:id/videos', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    const body = readBody(req);
+    const link = cleanVideoLink(body.video_link);
+
+    if (link === null) {
+        return res.status(400).json({ error: 'A video link must be a web address starting with http:// or https://.' });
+    }
+
+    const title = cleanVideoTitle(body.title ?? null);
+
+    if (!title.ok) {
+        return res.status(400).json({ error: `A video title must be text, up to ${TITLE_MAX_LENGTH} characters.` });
+    }
+
+    try {
+        const video = await withTransaction(async (client) => {
+            await lockLesson(client, lessonId);
+
+            const result = await client.query(
+                `INSERT INTO lesson_videos (subtopic_id, title, video_link, position)
+                 VALUES ($1, $2, $3, (SELECT COALESCE(MAX(position), 0) + 1 FROM lesson_videos WHERE subtopic_id = $1))
+                 RETURNING id, title, video_link, position`,
+                [lessonId, title.value, link]
+            );
+
+            await client.query('UPDATE subtopics SET updated_at = NOW() WHERE id = $1', [lessonId]);
+
+            return result.rows[0];
+        });
+
+        res.status(201).json(video);
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// Changes a video's title or link. Only the fields sent are changed.
+app.patch('/admin/videos/:id', async (req, res) => {
+    const videoId = parsePositiveInt(req.params.id);
+
+    if (videoId === null) {
+        return res.status(400).json({ error: 'Invalid video id.' });
+    }
+
+    const body = readBody(req);
+    const hasTitle = 'title' in body;
+    const hasLink = 'video_link' in body;
+
+    if (!hasTitle && !hasLink) {
+        return res.status(400).json({ error: 'Send at least one of: title, video_link.' });
+    }
+
+    let newTitle;
+    let newLink;
+
+    if (hasTitle) {
+        const cleaned = cleanVideoTitle(body.title);
+
+        if (!cleaned.ok) {
+            return res.status(400).json({ error: `A video title must be text, up to ${TITLE_MAX_LENGTH} characters.` });
+        }
+
+        newTitle = cleaned.value;
+    }
+
+    if (hasLink) {
+        newLink = cleanVideoLink(body.video_link);
+
+        if (newLink === null) {
+            return res.status(400).json({ error: 'A video link must be a web address starting with http:// or https://.' });
+        }
+    }
+
+    try {
+        const video = await withTransaction(async (client) => {
+            const found = await client.query('SELECT subtopic_id FROM lesson_videos WHERE id = $1', [videoId]);
+
+            if (found.rowCount === 0) {
+                throw new Refusal(404, { error: 'Video not found.' });
+            }
+
+            const lessonId = found.rows[0].subtopic_id;
+            await lockLesson(client, lessonId);
+
+            const result = await client.query(
+                `UPDATE lesson_videos
+                 SET title = CASE WHEN $2 THEN $3 ELSE title END,
+                     video_link = CASE WHEN $4 THEN $5 ELSE video_link END
+                 WHERE id = $1
+                 RETURNING id, title, video_link, position`,
+                [videoId, hasTitle, newTitle ?? null, hasLink, newLink ?? null]
+            );
+
+            await client.query('UPDATE subtopics SET updated_at = NOW() WHERE id = $1', [lessonId]);
+
+            return result.rows[0];
+        });
+
+        res.json(video);
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// Moves a video one place up or down in its lesson. Sends back the lesson's videos in their new order.
+app.post('/admin/videos/:id/move', async (req, res) => {
+    const videoId = parsePositiveInt(req.params.id);
+
+    if (videoId === null) {
+        return res.status(400).json({ error: 'Invalid video id.' });
+    }
+
+    const direction = readBody(req).direction;
+
+    if (direction !== 'up' && direction !== 'down') {
+        return res.status(400).json({ error: 'direction must be "up" or "down".' });
+    }
+
+    try {
+        const videos = await withTransaction(async (client) => {
+            const found = await client.query('SELECT subtopic_id, position FROM lesson_videos WHERE id = $1', [videoId]);
+
+            if (found.rowCount === 0) {
+                throw new Refusal(404, { error: 'Video not found.' });
+            }
+
+            const { subtopic_id: lessonId, position } = found.rows[0];
+            await lockLesson(client, lessonId);
+
+            // The neighbour is the next video in that direction, so gaps left by removed videos don't matter.
+            const neighbour = await client.query(
+                direction === 'up'
+                    ? 'SELECT id, position FROM lesson_videos WHERE subtopic_id = $1 AND position < $2 ORDER BY position DESC LIMIT 1'
+                    : 'SELECT id, position FROM lesson_videos WHERE subtopic_id = $1 AND position > $2 ORDER BY position ASC LIMIT 1',
+                [lessonId, position]
+            );
+
+            // Already first or last: nothing to move.
+            if (neighbour.rowCount === 0) {
+                return loadVideos(client, lessonId);
+            }
+
+            const other = neighbour.rows[0];
+
+            // Two videos can't share a place, so the swap goes in three moves, via a temporary place.
+            await client.query('UPDATE lesson_videos SET position = -1 WHERE id = $1', [videoId]);
+            await client.query('UPDATE lesson_videos SET position = $2 WHERE id = $1', [other.id, position]);
+            await client.query('UPDATE lesson_videos SET position = $2 WHERE id = $1', [videoId, other.position]);
+
+            await client.query('UPDATE subtopics SET updated_at = NOW() WHERE id = $1', [lessonId]);
+
+            return loadVideos(client, lessonId);
+        });
+
+        res.json(videos);
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// Removes a video. A live lesson can't lose its last piece of content, so that is refused.
+app.delete('/admin/videos/:id', async (req, res) => {
+    const videoId = parsePositiveInt(req.params.id);
+
+    if (videoId === null) {
+        return res.status(400).json({ error: 'Invalid video id.' });
+    }
+
+    try {
+        const videos = await withTransaction(async (client) => {
+            const found = await client.query('SELECT subtopic_id FROM lesson_videos WHERE id = $1', [videoId]);
+
+            if (found.rowCount === 0) {
+                throw new Refusal(404, { error: 'Video not found.' });
+            }
+
+            const lessonId = found.rows[0].subtopic_id;
+            const lesson = await lockLesson(client, lessonId);
+            const count = await client.query('SELECT COUNT(*)::int AS total FROM lesson_videos WHERE subtopic_id = $1', [lessonId]);
+
+            // The rules are checked as they would be AFTER the removal.
+            const wouldBeEmpty = findPublishProblems({
+                title: lesson.title,
+                note_content: lesson.note_content,
+                video_count: count.rows[0].total - 1
+            }).length > 0;
+
+            if (lesson.is_published && wouldBeEmpty) {
+                throw new Refusal(409, {
+                    error: 'A live lesson needs notes or at least one video. Add notes, or unpublish the lesson first.',
+                    code: 'LESSON_WOULD_BE_EMPTY'
+                });
+            }
+
+            await client.query('DELETE FROM lesson_videos WHERE id = $1', [videoId]);
+            await client.query('UPDATE subtopics SET updated_at = NOW() WHERE id = $1', [lessonId]);
+
+            return loadVideos(client, lessonId);
+        });
+
+        res.json(videos);
+    }
+    catch (err) {
+        handleAdminError(res, err);
     }
 });
 
