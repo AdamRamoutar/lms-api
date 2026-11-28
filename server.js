@@ -297,6 +297,62 @@ async function loadVideos(client, lessonId) {
     return result.rows;
 }
 
+// The tables whose rows have an order within a parent. Table and column names can't be sent as values in a query,
+// so they come from this fixed list and never from a request.
+const ORDERED_TABLES = {
+    modules: { parentTable: 'subjects', parentColumn: 'subject_id' },
+    topics: { parentTable: 'modules', parentColumn: 'module_id' },
+    subtopics: { parentTable: 'topics', parentColumn: 'topic_id' }
+};
+
+// Moves a row one place up or down among the rows with the same parent. Returns the parent's id.
+async function moveWithinParent(client, table, id, direction) {
+    const config = ORDERED_TABLES[table];
+
+    if (!config) {
+        throw new Error(`Not an ordered table: ${table}`);
+    }
+
+    const { parentTable, parentColumn } = config;
+
+    // Locking the parent makes everyone moving its children take turns.
+    await client.query(
+        `SELECT 1 FROM ${parentTable} WHERE id = (SELECT ${parentColumn} FROM ${table} WHERE id = $1) FOR UPDATE`,
+        [id]
+    );
+
+    // Read after the lock, so the position is never out of date.
+    const found = await client.query(`SELECT ${parentColumn} AS parent_id, position FROM ${table} WHERE id = $1`, [id]);
+
+    if (found.rowCount === 0) {
+        throw new Refusal(404, { error: 'Not found.' });
+    }
+
+    const { parent_id: parentId, position } = found.rows[0];
+
+    // The neighbour is the next row in that direction, so gaps left by deleted rows don't matter.
+    const neighbour = await client.query(
+        direction === 'up'
+            ? `SELECT id, position FROM ${table} WHERE ${parentColumn} = $1 AND position < $2 ORDER BY position DESC LIMIT 1`
+            : `SELECT id, position FROM ${table} WHERE ${parentColumn} = $1 AND position > $2 ORDER BY position ASC LIMIT 1`,
+        [parentId, position]
+    );
+
+    // Already first or last: nothing to move.
+    if (neighbour.rowCount === 0) {
+        return parentId;
+    }
+
+    const other = neighbour.rows[0];
+
+    // Two rows can't share a place, so the swap goes in three moves, via a temporary place.
+    await client.query(`UPDATE ${table} SET position = -1 WHERE id = $1`, [id]);
+    await client.query(`UPDATE ${table} SET position = $2 WHERE id = $1`, [other.id, position]);
+    await client.query(`UPDATE ${table} SET position = $2 WHERE id = $1`, [id, other.position]);
+
+    return parentId;
+}
+
 // ---------- Browsing: levels, subjects, topics, lessons ----------
 // Titles are public. Only a lesson's content is protected.
 
@@ -1193,6 +1249,282 @@ app.delete('/admin/lessons/:id', async (req, res) => {
         });
 
         res.json({ message: 'Lesson deleted.', deleted });
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// The whole structure of a subject for the content tree: sections, topics and lessons, drafts included.
+app.get('/admin/subjects/:id/tree', async (req, res) => {
+    const subjectId = parsePositiveInt(req.params.id);
+
+    if (subjectId === null) {
+        return res.status(400).json({ error: 'Invalid subject id.' });
+    }
+
+    try {
+        const subjectResult = await pool.query(
+            `SELECT s.id, s.name, s.description, s.unit, l.name AS level_name
+             FROM subjects AS s
+             JOIN levels AS l ON l.id = s.level_id
+             WHERE s.id = $1`,
+            [subjectId]
+        );
+
+        if (subjectResult.rowCount === 0) {
+            return res.status(404).json({ error: 'Subject not found.' });
+        }
+
+        // The three lists don't depend on each other, so they run together.
+        const [modulesResult, topicsResult, lessonsResult] = await Promise.all([
+            pool.query('SELECT id, title, position FROM modules WHERE subject_id = $1 ORDER BY position', [subjectId]),
+            pool.query(
+                `SELECT t.id, t.module_id, t.title, t.position
+                 FROM topics AS t
+                 JOIN modules AS m ON m.id = t.module_id
+                 WHERE m.subject_id = $1
+                 ORDER BY t.position`,
+                [subjectId]
+            ),
+            pool.query(
+                `SELECT st.id, st.topic_id, st.title, st.position, st.is_free, st.is_published,
+                        (COALESCE(btrim(st.note_content), '') <> '') AS has_notes,
+                        (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS video_count
+                 FROM subtopics AS st
+                 JOIN topics AS t ON t.id = st.topic_id
+                 JOIN modules AS m ON m.id = t.module_id
+                 WHERE m.subject_id = $1
+                 ORDER BY st.position`,
+                [subjectId]
+            )
+        ]);
+
+        const modules = modulesResult.rows.map((moduleRow) => ({
+            ...moduleRow,
+            topics: topicsResult.rows
+                .filter((topicRow) => topicRow.module_id === moduleRow.id)
+                .map((topicRow) => ({
+                    ...topicRow,
+                    lessons: lessonsResult.rows.filter((lessonRow) => lessonRow.topic_id === topicRow.id)
+                }))
+        }));
+
+        res.json({ ...subjectResult.rows[0], modules });
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Adds a section at the end of a subject. Students don't see it until it has something live in it (see the visibility step).
+app.post('/admin/subjects/:id/modules', async (req, res) => {
+    const subjectId = parsePositiveInt(req.params.id);
+
+    if (subjectId === null) {
+        return res.status(400).json({ error: 'Invalid subject id.' });
+    }
+
+    const title = cleanTitle(readBody(req).title);
+
+    if (title === null) {
+        return res.status(400).json({ error: `A title is required, up to ${TITLE_MAX_LENGTH} characters.` });
+    }
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO modules (title, position, subject_id)
+             VALUES ($1, (SELECT COALESCE(MAX(position), 0) + 1 FROM modules WHERE subject_id = $2), $2)
+             RETURNING id, title, position`,
+            [title, subjectId]
+        );
+
+        res.status(201).json(result.rows[0]);
+    }
+    catch (err) {
+        // 23503 is a foreign key violation: the subject doesn't exist.
+        if (err.code === '23503') {
+            return res.status(404).json({ error: 'Subject not found.' });
+        }
+
+        // 23505 is a unique violation: another section took the same position at the same moment.
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'Another section was added at the same moment. Please try again.' });
+        }
+
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Renames a section.
+app.patch('/admin/modules/:id', async (req, res) => {
+    const moduleId = parsePositiveInt(req.params.id);
+
+    if (moduleId === null) {
+        return res.status(400).json({ error: 'Invalid section id.' });
+    }
+
+    const title = cleanTitle(readBody(req).title);
+
+    if (title === null) {
+        return res.status(400).json({ error: `A title is required, up to ${TITLE_MAX_LENGTH} characters.` });
+    }
+
+    try {
+        const result = await pool.query(
+            'UPDATE modules SET title = $1 WHERE id = $2 RETURNING id, title, position',
+            [title, moduleId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Section not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Moves a section one place up or down in its subject. Sends back the subject's sections in their new order.
+app.post('/admin/modules/:id/move', async (req, res) => {
+    const moduleId = parsePositiveInt(req.params.id);
+
+    if (moduleId === null) {
+        return res.status(400).json({ error: 'Invalid section id.' });
+    }
+
+    const direction = readBody(req).direction;
+
+    if (direction !== 'up' && direction !== 'down') {
+        return res.status(400).json({ error: 'direction must be "up" or "down".' });
+    }
+
+    try {
+        const modules = await withTransaction(async (client) => {
+            const subjectId = await moveWithinParent(client, 'modules', moduleId, direction);
+            const result = await client.query(
+                'SELECT id, title, position FROM modules WHERE subject_id = $1 ORDER BY position',
+                [subjectId]
+            );
+
+            return result.rows;
+        });
+
+        res.json(modules);
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// What deleting a section would remove, so the page can say so before it asks.
+app.get('/admin/modules/:id/impact', async (req, res) => {
+    const moduleId = parsePositiveInt(req.params.id);
+
+    if (moduleId === null) {
+        return res.status(400).json({ error: 'Invalid section id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT m.title,
+                    (SELECT COUNT(*)::int FROM topics WHERE module_id = m.id) AS topic_count,
+                    COUNT(st.id)::int AS lesson_count,
+                    (COUNT(st.id) FILTER (WHERE st.is_published))::int AS live_lesson_count,
+                    (SELECT COUNT(*)::int
+                     FROM lesson_videos AS lv
+                     JOIN subtopics AS s3 ON s3.id = lv.subtopic_id
+                     JOIN topics AS t3 ON t3.id = s3.topic_id
+                     WHERE t3.module_id = m.id) AS video_count,
+                    (SELECT COUNT(DISTINCT lp.user_id)::int
+                     FROM lesson_progress AS lp
+                     JOIN subtopics AS s2 ON s2.id = lp.subtopic_id
+                     JOIN topics AS t2 ON t2.id = s2.topic_id
+                     WHERE t2.module_id = m.id) AS students_affected
+             FROM modules AS m
+             LEFT JOIN topics AS t ON t.module_id = m.id
+             LEFT JOIN subtopics AS st ON st.topic_id = t.id
+             WHERE m.id = $1
+             GROUP BY m.id`,
+            [moduleId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Section not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Deletes a section with its topics, lessons, videos and every student's progress in it.
+// A section containing a live lesson can't be deleted: unpublish those lessons first.
+app.delete('/admin/modules/:id', async (req, res) => {
+    const moduleId = parsePositiveInt(req.params.id);
+
+    if (moduleId === null) {
+        return res.status(400).json({ error: 'Invalid section id.' });
+    }
+
+    try {
+        const deleted = await withTransaction(async (client) => {
+            const moduleResult = await client.query('SELECT title FROM modules WHERE id = $1 FOR UPDATE', [moduleId]);
+
+            if (moduleResult.rowCount === 0) {
+                throw new Refusal(404, { error: 'Section not found.' });
+            }
+
+            // Every lesson in the section is locked while we decide, so none can be published in between.
+            const lessons = await client.query(
+                `SELECT st.id, st.is_published
+                 FROM subtopics AS st
+                 JOIN topics AS t ON t.id = st.topic_id
+                 WHERE t.module_id = $1
+                 FOR UPDATE OF st`,
+                [moduleId]
+            );
+
+            const liveLessons = lessons.rows.filter((lessonRow) => lessonRow.is_published).length;
+
+            if (liveLessons > 0) {
+                throw new Refusal(409, {
+                    error: `This section has ${liveLessons} live ${liveLessons === 1 ? 'lesson' : 'lessons'}. Unpublish ${liveLessons === 1 ? 'it' : 'them'} first, then delete the section.`,
+                    code: 'CONTAINS_LIVE_LESSONS',
+                    live_lessons: liveLessons
+                });
+            }
+
+            // Counted before the delete, so the answer can say what was removed.
+            const counts = await client.query(
+                `SELECT (SELECT COUNT(*)::int FROM topics WHERE module_id = $1) AS topics,
+                        (SELECT COUNT(*)::int
+                         FROM lesson_videos AS lv
+                         JOIN subtopics AS st ON st.id = lv.subtopic_id
+                         JOIN topics AS t ON t.id = st.topic_id
+                         WHERE t.module_id = $1) AS videos,
+                        (SELECT COUNT(DISTINCT lp.user_id)::int
+                         FROM lesson_progress AS lp
+                         JOIN subtopics AS st ON st.id = lp.subtopic_id
+                         JOIN topics AS t ON t.id = st.topic_id
+                         WHERE t.module_id = $1) AS students_affected`,
+                [moduleId]
+            );
+
+            await client.query('DELETE FROM modules WHERE id = $1', [moduleId]);
+
+            return { title: moduleResult.rows[0].title, lessons: lessons.rowCount, ...counts.rows[0] };
+        });
+
+        res.json({ message: 'Section deleted.', deleted });
     }
     catch (err) {
         handleAdminError(res, err);
