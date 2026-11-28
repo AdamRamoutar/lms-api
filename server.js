@@ -297,6 +297,22 @@ async function loadVideos(client, lessonId) {
     return result.rows;
 }
 
+// The lessons in a topic, drafts included, with what an admin needs to see at a glance.
+// "Has notes" means real text, so a blank note counts as no note.
+async function loadAdminLessons(client, topicId) {
+    const result = await client.query(
+        `SELECT st.id, st.title, st.position, st.is_free, st.is_published, st.updated_at,
+                (COALESCE(btrim(st.note_content), '') <> '') AS has_notes,
+                (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS video_count
+         FROM subtopics AS st
+         WHERE st.topic_id = $1
+         ORDER BY st.position`,
+        [topicId]
+    );
+
+    return result.rows;
+}
+
 // The tables whose rows have an order within a parent. Table and column names can't be sent as values in a query,
 // so they come from this fixed list and never from a request.
 const ORDERED_TABLES = {
@@ -677,7 +693,7 @@ app.get('/subjects/:id/progress', authenticateToken, async (req, res) => {
 // It must stay above every admin route, because Express runs things from the top down.
 app.use('/admin', authenticateToken, requireAdmin);
 
-// The lessons in a topic, drafts included, with what an admin needs to see at a glance.
+// The lessons in a topic, drafts included.
 app.get('/admin/topics/:id/lessons', async (req, res) => {
     const topicId = parsePositiveInt(req.params.id);
 
@@ -692,18 +708,7 @@ app.get('/admin/topics/:id/lessons', async (req, res) => {
             return res.status(404).json({ error: 'Topic not found.' });
         }
 
-        // "Has notes" means real text, so a blank note counts as no note.
-        const result = await pool.query(
-            `SELECT st.id, st.title, st.position, st.is_free, st.is_published, st.updated_at,
-                    (COALESCE(btrim(st.note_content), '') <> '') AS has_notes,
-                    (SELECT COUNT(*)::int FROM lesson_videos AS lv WHERE lv.subtopic_id = st.id) AS video_count
-             FROM subtopics AS st
-             WHERE st.topic_id = $1
-             ORDER BY st.position`,
-            [topicId]
-        );
-
-        res.json(result.rows);
+        res.json(await loadAdminLessons(pool, topicId));
     }
     catch (err) {
         console.error(err);
@@ -1525,6 +1530,235 @@ app.delete('/admin/modules/:id', async (req, res) => {
         });
 
         res.json({ message: 'Section deleted.', deleted });
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// Adds a topic at the end of a section.
+app.post('/admin/modules/:id/topics', async (req, res) => {
+    const moduleId = parsePositiveInt(req.params.id);
+
+    if (moduleId === null) {
+        return res.status(400).json({ error: 'Invalid section id.' });
+    }
+
+    const title = cleanTitle(readBody(req).title);
+
+    if (title === null) {
+        return res.status(400).json({ error: `A title is required, up to ${TITLE_MAX_LENGTH} characters.` });
+    }
+
+    try {
+        const result = await pool.query(
+            `INSERT INTO topics (title, position, module_id)
+             VALUES ($1, (SELECT COALESCE(MAX(position), 0) + 1 FROM topics WHERE module_id = $2), $2)
+             RETURNING id, title, position`,
+            [title, moduleId]
+        );
+
+        res.status(201).json(result.rows[0]);
+    }
+    catch (err) {
+        // 23503 is a foreign key violation: the section doesn't exist.
+        if (err.code === '23503') {
+            return res.status(404).json({ error: 'Section not found.' });
+        }
+
+        // 23505 is a unique violation: another topic took the same position at the same moment.
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'Another topic was added at the same moment. Please try again.' });
+        }
+
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Renames a topic.
+app.patch('/admin/topics/:id', async (req, res) => {
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
+
+    const title = cleanTitle(readBody(req).title);
+
+    if (title === null) {
+        return res.status(400).json({ error: `A title is required, up to ${TITLE_MAX_LENGTH} characters.` });
+    }
+
+    try {
+        const result = await pool.query(
+            'UPDATE topics SET title = $1 WHERE id = $2 RETURNING id, title, position',
+            [title, topicId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Topic not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Moves a topic one place up or down in its section. Sends back the section's topics in their new order.
+app.post('/admin/topics/:id/move', async (req, res) => {
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
+
+    const direction = readBody(req).direction;
+
+    if (direction !== 'up' && direction !== 'down') {
+        return res.status(400).json({ error: 'direction must be "up" or "down".' });
+    }
+
+    try {
+        const topics = await withTransaction(async (client) => {
+            const moduleId = await moveWithinParent(client, 'topics', topicId, direction);
+            const result = await client.query(
+                'SELECT id, title, position FROM topics WHERE module_id = $1 ORDER BY position',
+                [moduleId]
+            );
+
+            return result.rows;
+        });
+
+        res.json(topics);
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// What deleting a topic would remove, so the page can say so before it asks.
+app.get('/admin/topics/:id/impact', async (req, res) => {
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
+
+    try {
+        const result = await pool.query(
+            `SELECT t.title,
+                    (SELECT COUNT(*)::int FROM subtopics WHERE topic_id = t.id) AS lesson_count,
+                    (SELECT COUNT(*)::int FROM subtopics WHERE topic_id = t.id AND is_published) AS live_lesson_count,
+                    (SELECT COUNT(*)::int
+                     FROM lesson_videos AS lv
+                     JOIN subtopics AS st ON st.id = lv.subtopic_id
+                     WHERE st.topic_id = t.id) AS video_count,
+                    (SELECT COUNT(DISTINCT lp.user_id)::int
+                     FROM lesson_progress AS lp
+                     JOIN subtopics AS st ON st.id = lp.subtopic_id
+                     WHERE st.topic_id = t.id) AS students_affected
+             FROM topics AS t
+             WHERE t.id = $1`,
+            [topicId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Topic not found.' });
+        }
+
+        res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Deletes a topic with its lessons, videos and every student's progress in it.
+// A topic containing a live lesson can't be deleted: unpublish those lessons first.
+app.delete('/admin/topics/:id', async (req, res) => {
+    const topicId = parsePositiveInt(req.params.id);
+
+    if (topicId === null) {
+        return res.status(400).json({ error: 'Invalid topic id.' });
+    }
+
+    try {
+        const deleted = await withTransaction(async (client) => {
+            const topicResult = await client.query('SELECT title FROM topics WHERE id = $1 FOR UPDATE', [topicId]);
+
+            if (topicResult.rowCount === 0) {
+                throw new Refusal(404, { error: 'Topic not found.' });
+            }
+
+            // Every lesson in the topic is locked while we decide, so none can be published in between.
+            const lessons = await client.query(
+                'SELECT id, is_published FROM subtopics WHERE topic_id = $1 FOR UPDATE',
+                [topicId]
+            );
+
+            const liveLessons = lessons.rows.filter((lessonRow) => lessonRow.is_published).length;
+
+            if (liveLessons > 0) {
+                throw new Refusal(409, {
+                    error: `This topic has ${liveLessons} live ${liveLessons === 1 ? 'lesson' : 'lessons'}. Unpublish ${liveLessons === 1 ? 'it' : 'them'} first, then delete the topic.`,
+                    code: 'CONTAINS_LIVE_LESSONS',
+                    live_lessons: liveLessons
+                });
+            }
+
+            // Counted before the delete, so the answer can say what was removed.
+            const counts = await client.query(
+                `SELECT (SELECT COUNT(*)::int
+                         FROM lesson_videos AS lv
+                         JOIN subtopics AS st ON st.id = lv.subtopic_id
+                         WHERE st.topic_id = $1) AS videos,
+                        (SELECT COUNT(DISTINCT lp.user_id)::int
+                         FROM lesson_progress AS lp
+                         JOIN subtopics AS st ON st.id = lp.subtopic_id
+                         WHERE st.topic_id = $1) AS students_affected`,
+                [topicId]
+            );
+
+            await client.query('DELETE FROM topics WHERE id = $1', [topicId]);
+
+            return { title: topicResult.rows[0].title, lessons: lessons.rowCount, ...counts.rows[0] };
+        });
+
+        res.json({ message: 'Topic deleted.', deleted });
+    }
+    catch (err) {
+        handleAdminError(res, err);
+    }
+});
+
+// Moves a lesson one place up or down in its topic. Sends back the topic's lessons in their new order.
+// Moving only changes the order, so it doesn't change the lesson itself.
+app.post('/admin/lessons/:id/move', async (req, res) => {
+    const lessonId = parsePositiveInt(req.params.id);
+
+    if (lessonId === null) {
+        return res.status(400).json({ error: 'Invalid lesson id.' });
+    }
+
+    const direction = readBody(req).direction;
+
+    if (direction !== 'up' && direction !== 'down') {
+        return res.status(400).json({ error: 'direction must be "up" or "down".' });
+    }
+
+    try {
+        const lessons = await withTransaction(async (client) => {
+            const topicId = await moveWithinParent(client, 'subtopics', lessonId, direction);
+
+            return loadAdminLessons(client, topicId);
+        });
+
+        res.json(lessons);
     }
     catch (err) {
         handleAdminError(res, err);
